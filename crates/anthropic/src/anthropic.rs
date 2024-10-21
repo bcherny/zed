@@ -9,7 +9,9 @@ use futures::{io::BufReader, stream::BoxStream, AsyncBufReadExt, AsyncReadExt, S
 use http_client::http::{HeaderMap, HeaderValue};
 use http_client::{AsyncBody, HttpClient, HttpRequestExt, Method, Request as HttpRequest};
 use serde::{Deserialize, Serialize};
+use std::env;
 use strum::{EnumIter, EnumString};
+use telemetry_events::{AssistantEvent, AssistantKind, AssistantPhase};
 use thiserror::Error;
 use util::ResultExt as _;
 
@@ -319,6 +321,81 @@ pub async fn stream_completion_with_rate_limit_info(
             })
             .boxed();
         Ok((stream, rate_limits.log_err()))
+    } else {
+        let mut body = Vec::new();
+        response
+            .body_mut()
+            .read_to_end(&mut body)
+            .await
+            .context("failed to read response body")?;
+
+        let body_str =
+            std::str::from_utf8(&body).context("failed to parse response body as UTF-8")?;
+
+        match serde_json::from_str::<Event>(body_str) {
+            Ok(Event::Error { error }) => Err(AnthropicError::ApiError(error)),
+            Ok(_) => Err(AnthropicError::Other(anyhow!(
+                "Unexpected success response while expecting an error: '{body_str}'",
+            ))),
+            Err(_) => Err(AnthropicError::Other(anyhow!(
+                "Failed to connect to API: {} {}",
+                response.status(),
+                body_str,
+            ))),
+        }
+    }
+}
+
+pub async fn log_completion_events(
+    client: &dyn HttpClient,
+    api_url: &str,
+    api_key: &str,
+    low_speed_timeout: Option<Duration>,
+    events: Vec<AssistantEvent>,
+) -> Result<(), AnthropicError> {
+    let uri = format!("{api_url}/v1/log/zed");
+    let mut request_builder = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("X-Api-Key", api_key)
+        .header("Content-Type", "application/json");
+    if let Some(low_speed_timeout) = low_speed_timeout {
+        request_builder = request_builder.read_timeout(low_speed_timeout);
+    }
+    let serialized_events: serde_json::Value = serde_json::json!({
+        "events": events.iter().map(|event| {
+            serde_json::json!({
+                "completion_type": match event.kind {
+                    AssistantKind::Inline => "natural_language_completion",
+                    AssistantKind::Panel => "conversation_message",
+                },
+                "event": match event.phase {
+                    AssistantPhase::Response => "response",
+                    AssistantPhase::Invoked => "invoke",
+                    AssistantPhase::Accepted => "accept",
+                    AssistantPhase::Rejected => "reject",
+                },
+                "metadata": {
+                    "conversation_id": event.conversation_id,
+                    "language_name": event.language_name,
+                    "platform": env::consts::OS,
+                }
+            })
+        }).collect::<Vec<_>>()
+    });
+
+    log::debug!("serialized_events");
+    let request = request_builder
+        .body(AsyncBody::from(serialized_events.to_string()))
+        .context("failed to construct request body")?;
+
+    let mut response = client
+        .send(request)
+        .await
+        .context("failed to send request to Anthropic")?;
+    if response.status().is_success() {
+        let rate_limits = RateLimitInfo::from_headers(response.headers());
+        rate_limits.map(|_| ()).map_err(AnthropicError::Other)
     } else {
         let mut body = Vec::new();
         response

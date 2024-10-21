@@ -333,6 +333,34 @@ impl AnthropicModel {
         }
         .boxed()
     }
+
+    fn log_completion_events(&self, events: Vec<AssistantEvent>) -> Result<(), AnthropicError> {
+        let http_client = self.http_client.clone();
+
+        let Ok((api_key, api_url, low_speed_timeout)) = cx.read_model(&self.state, |state, cx| {
+            let settings = &AllLanguageModelSettings::get_global(cx).anthropic;
+            (
+                state.api_key.clone(),
+                settings.api_url.clone(),
+                settings.low_speed_timeout,
+            )
+        }) else {
+            return futures::future::ready(Err(anyhow!("App state dropped"))).boxed();
+        };
+
+        async move {
+            let api_key = api_key.ok_or_else(|| anyhow!("Missing Anthropic API Key"))?;
+            let request = anthropic::log_completion_events(
+                http_client.as_ref(),
+                &api_url,
+                &api_key,
+                low_speed_timeout,
+                events,
+            );
+            request.await.context("failed to stream completion")
+        }
+        .boxed()
+    }
 }
 
 impl LanguageModel for AnthropicModel {

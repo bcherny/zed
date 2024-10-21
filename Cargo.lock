@@ -245,10 +245,12 @@ dependencies = [
  "chrono",
  "futures 0.3.30",
  "http_client",
+ "log",
  "schemars",
  "serde",
  "serde_json",
  "strum 0.25.0",
+ "telemetry_events",
  "thiserror",
  "util",
 ]
@@ -2392,6 +2394,7 @@ dependencies = [
 name = "client"
 version = "0.1.0"
 dependencies = [
+ "anthropic",
  "anyhow",
  "async-native-tls",
  "async-recursion 0.3.2",

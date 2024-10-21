@@ -1,6 +1,7 @@
 mod event_coalescer;
 
 use crate::{ChannelId, TelemetrySettings};
+use anthropic::log_completion_events as log_anthropic_completion_events;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use clock::SystemClock;
@@ -630,7 +631,41 @@ impl Telemetry {
         if events.is_empty() {
             return;
         }
+        self.flush_events_to_zed(events);
+        self.flush_events_to_anthropic(events);
+    }
 
+    fn flush_events_to_anthropic(self: &Arc<Self>, cx: &AppContext, events: Vec<EventWrapper>) {
+        let anthropic_events = events.into_iter()
+            .filter(|event| {
+                matches!(event.event, Event::InlineCompletion(InlineCompletionEvent { provider, .. }) if provider == "anthropic")
+            })
+            .collect::<Vec<_>>();
+
+        if anthropic_events.is_empty() {
+            return;
+        }
+
+        let Some(model) = LanguageModelRegistry::read_global(cx).active_model()? else {
+            log::warn!("Can't log telemetry because there's no active model.");
+            return;
+        };
+
+        if let Some(model) = model.as_any().downcast_ref::<AnthropicModel>() {
+            let this = self.clone();
+            self.executor
+                .spawn(async move {
+                    model.log_completion_events(anthropic_events).await;
+                })
+                .detach();
+        } else {
+            log::warn!(
+                "Can't log Anthropic telemetry because the active model is not an AnthropicModel."
+            );
+        }
+    }
+
+    fn flush_events_to_zed(self: &Arc<Self>, events: Vec<EventWrapper>) {
         let this = self.clone();
         self.executor
             .spawn(
@@ -649,21 +684,7 @@ impl Telemetry {
 
                     let request_body = {
                         let state = this.state.lock();
-
-                        EventRequestBody {
-                            system_id: state.system_id.as_deref().map(Into::into),
-                            installation_id: state.installation_id.as_deref().map(Into::into),
-                            session_id: state.session_id.clone(),
-                            metrics_id: state.metrics_id.as_deref().map(Into::into),
-                            is_staff: state.is_staff,
-                            app_version: state.app_version.clone(),
-                            os_name: state.os_name.clone(),
-                            os_version: state.os_version.clone(),
-                            architecture: state.architecture.to_string(),
-
-                            release_channel: state.release_channel.map(Into::into),
-                            events,
-                        }
+                        self.build_event_request_body(state, events);
                     };
 
                     let request = this.build_request(json_bytes, request_body)?;
@@ -676,6 +697,26 @@ impl Telemetry {
                 .log_err(),
             )
             .detach();
+    }
+
+    fn build_event_request_body(
+        state: &TelemetryState,
+        events: Vec<EventWrapper>,
+    ) -> EventRequestBody {
+        EventRequestBody {
+            system_id: state.system_id.as_deref().map(Into::into),
+            installation_id: state.installation_id.as_deref().map(Into::into),
+            session_id: state.session_id.clone(),
+            metrics_id: state.metrics_id.as_deref().map(Into::into),
+            is_staff: state.is_staff,
+            app_version: state.app_version.clone(),
+            os_name: state.os_name.clone(),
+            os_version: state.os_version.clone(),
+            architecture: state.architecture.to_string(),
+
+            release_channel: state.release_channel.map(Into::into),
+            events,
+        };
     }
 }
 
